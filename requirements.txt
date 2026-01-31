@@ -53,6 +53,7 @@ pydantic_core==2.41.5
 pydub==0.25.1
 pyloudnorm==0.1.1
 python-dotenv==1.2.1
+python-multipart==0.0.22
 PyYAML==6.0.3
 regex==2026.1.15
 resampy==0.4.3
