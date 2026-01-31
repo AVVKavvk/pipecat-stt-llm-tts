@@ -1,186 +1,168 @@
-from __future__ import annotations
+#
+# Copyright (c) 2025, Daily
+#
+# SPDX-License-Identifier: BSD 2-Clause License
+#
 
-
-from fastapi import FastAPI, Form, WebSocket, Query, HTTPException, Request
-import websocket
-from fastapi.responses import JSONResponse, HTMLResponse
-import httpx
-import json
-import urllib.parse
 import os
+from asyncio.transports import BaseTransport
+
 from dotenv import load_dotenv
+from loguru import logger
+
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.frames.frames import EndFrame, LLMMessagesUpdateFrame
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,UserTurnStoppedMessage,
+    AssistantThoughtMessage, AssistantTurnStoppedMessage
+)
+from pipecat.runner.types import RunnerArguments
+from pipecat.runner.utils import parse_telephony_websocket
+from pipecat.serializers.plivo import PlivoFrameSerializer
+from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.transports.base_transport import BaseTransport
+from pipecat.transports.websocket.fastapi import (
+    FastAPIWebsocketParams,
+    FastAPIWebsocketTransport,
+)
 
 load_dotenv()
 
-import base64
-FastAPI(title="Voice Sandwich (Gemini)")
 
-app=FastAPI()
+async def run_bot(transport: BaseTransport, handle_sigint: bool):
+    # Initialize services
+    llm = OpenAILLMService(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        model="gpt-4o-mini"
+    )
 
-@app.post("/vobiz/outbound-call")
-async def vobiz_outbound_call(request: Request) -> JSONResponse:
-    print(f"[Vobiz] outbound call api is triggered")
+    stt = DeepgramSTTService(
+        api_key=os.getenv("DEEPGRAM_API_KEY"),
+        model="nova-2-general"
+    )
 
-    try:
-        data = await request.json()
-        if not data.get("from_number") or not data.get("to_number"):
-            raise HTTPException(
-                status_code=400,
-                detail="Missing 'phone_number' or 'to_number' in the request body",
+    tts = CartesiaTTSService(
+        api_key=os.getenv("CARTESIA_API_KEY"),
+        voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
+    )
+
+    # System prompt
+    messages = [
+        {
+            "role": "system",
+            "content": "You are an elementary teacher in an audio call. Your output will be converted to audio so don't include special characters in your answers. Respond to what the student said in a short sentence.",
+        },
+    ]
+
+    # Create context using the universal LLMContext
+    context = LLMContext(messages)
+    
+    # Create aggregators using the universal API
+    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
+
+    # Build pipeline
+    pipeline = Pipeline(
+        [
+            transport.input(),  # Websocket input from client
+            stt,  # Speech-To-Text
+            user_aggregator,  # User context aggregator
+            llm,  # LLM
+            tts,  # Text-To-Speech
+            transport.output(),  # Websocket output to client
+            assistant_aggregator,  # Assistant context aggregator
+        ]
+    )
+
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            audio_in_sample_rate=8000,
+            audio_out_sample_rate=8000,
+            enable_metrics=True,
+            enable_usage_metrics=True,
+        ),
+    )
+
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        # Kick off the conversation with introduction
+        await task.queue_frames([
+            LLMMessagesUpdateFrame(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Please introduce yourself to the user."
+                    }
+                ],
+                run_llm=True
             )
-        from_number = data.get("from_number")
-        to_number = data.get("to_number")
-        body_data = data.get("body", {})
-        print(f"\n[DEBUG] Body data: {body_data}")
+        ])
 
-        host, protocol = websocket.get_host_and_protocol(request)
-        answer_url = f"{protocol}://{host}/answer"
-        if body_data:
-            body_json = json.dumps(body_data)
-            body_encoded = urllib.parse.quote(body_json)
-            answer_url = f"{answer_url}?body_data={body_encoded}"
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        await task.queue_frame(EndFrame())
 
-        print(f"[INFO] Answer URL that will be sent to Vobiz: {answer_url}")
+    runner = PipelineRunner(handle_sigint=handle_sigint)
+    
+    @user_aggregator.event_handler("on_user_turn_stopped")
+    async def on_user_turn_stopped(aggregator, strategy, message: UserTurnStoppedMessage):
+        timestamp = f"[{message.timestamp}] " if message.timestamp else ""
+        line = f"{timestamp}user: {message.content}"
+        print(f"Transcript: {line}")
 
-        url = f"https://api.vobiz.ai/api/v1/Account/{os.getenv("VOBIZ_AUTH_ID")}/Call/"
-        headers = {
-            "X-Auth-ID": os.getenv("VOBIZ_AUTH_ID"),
-            "X-Auth-Token": os.getenv("VOBIZ_AUTH_TOKEN"),
-            "Content-Type": "application/json",
-        }
-        body = {
-            "from": from_number,
-            "to": to_number,
-            "answer_url": answer_url,
-            "answer_method": "POST",
-        }
-
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(url, headers=headers, json=body)
-
-        if resp.status_code != 201:
-            print(
-                f"[ERROR] Vobiz API call failed with status {resp.status_code} : {resp.text}"
-            )
-            raise HTTPException(
-                status_code=resp.status_code,
-                detail=f"Vobiz API error: {resp.text}",
-            )
-
-        print(f"[SUCCESS] Vobiz API call successful!")
-        return JSONResponse(
-            status_code=200,
-            content={
-                "success": True,
-                "data": resp.json(),
-            },
-        )
-
-    except HTTPException:
-        raise
-
-    except httpx.RequestError as exc:
-        print(f"[ERROR] HTTPX request error: {exc}")
-        raise HTTPException(
-            status_code=502,
-            detail=f"Vobiz API request failed: {str(exc)}",
-        )
-
-    except Exception as exc:
-        print(f"[ERROR] Unexpected error in outbound call: {exc}")
-        raise HTTPException(
-            status_code=500,
-            detail="Internal server error while initiating outbound call",
-        )
-
-
-@app.api_route("/incoming-call", methods=["POST"])
-async def vobiz_answer(
-    request: Request,
-    body_data: str = Form(None)
-) -> HTMLResponse:
-    print("Serving answer XML for vobiz call")
-
-    form_data = await request.form()
-    print(f"[DEBUG] Full Form Data received: {dict(form_data)}")
-    parsed_body_data = {}
-    if body_data:
-        try:
-            parsed_body_data = json.loads(body_data)
-        except json.JSONDecodeError:
-            print(f"Failed to parse body data: {body_data}")
-
-    try:
-        host, protocol = websocket.get_host_and_protocol(request)
-        base_ws_url = websocket.get_vobiz_websocket_url(host)
-        query_params = []
-
-        if parsed_body_data:
-            body_json = json.dumps(parsed_body_data)
-            body_encoded = base64.b64encode(body_json.encode("utf-8")).decode("utf-8")
-            query_params.append(f"body={body_encoded}")
-
-        if query_params:
-            ws_url = f"{base_ws_url}?{'&amp;'.join(query_params)}"
-        else:
-            ws_url = base_ws_url
-        print(
-            f"[INFO] WebSocket URL being sent to Vobiz: {ws_url}, Host: {host}"
-        )
-
-        xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-            <Response>
-                <Stream 
-                    bidirectional="true" 
-                    keepCallAlive="true" 
-                    contentType="audio/x-mulaw;rate=8000">
-                    {ws_url}
-                </Stream>
-            </Response>
-            """
-
-        print(f"Answer Url is hit")
-        return HTMLResponse(content=xml_content, media_type="application/xml")
-
-    except Exception as e:
-        print(f"Error generating answer XML: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate XML: {str(e)}")
-
-
-@app.websocket("/stream")
-async def websocket_stream(
-    socket: WebSocket,
-    body: str = Query(None),
-    serviceHost: str = Query(None),
-):
-    """Handle WebSocket connection at /stream path."""
-    await websocket.handle_vobiz_websocket(socket, "/stream", body, serviceHost)
-
-
-
-
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-
-@app.post("/hangup")
-async def hangup(request: Request):
-    try:
-        # Parse the form data into a dictionary
-        form_data = await request.form()
-        body = dict(form_data)
+    @assistant_aggregator.event_handler("on_assistant_turn_stopped")
+    async def on_assistant_turn_stopped(aggregator, message: AssistantTurnStoppedMessage):
+        timestamp = f"[{message.timestamp}] " if message.timestamp else ""
+        line = f"{timestamp}assistant: {message.content}"
+        print(f"Transcript: {line}")
         
-        print("Hangup called")
-        print(body)
+    @assistant_aggregator.event_handler("on_assistant_thought")
+    async def on_assistant_thought(aggregator, message: AssistantThoughtMessage):
+        timestamp = f"[{message.timestamp}] " if message.timestamp else ""
+        line = f"{timestamp}assistant: {message.content}"
+        print(f"Thought: {line}")
         
-        return {"status": "received"}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to hangup: {str(e)}")
+
+    await runner.run(task)
 
 
+async def bot(runner_args: RunnerArguments):
+    """Main bot entry point compatible with Pipecat Cloud."""
 
+    transport_type, call_data = await parse_telephony_websocket(runner_args.websocket)
+    logger.info(f"Auto-detected transport: {transport_type}")
 
+    # Initialize Plivo serializer
+    serializer = PlivoFrameSerializer(
+        stream_id=call_data["stream_id"],
+        call_id=call_data["call_id"],
+        auth_id=os.getenv("PLIVO_AUTH_ID", ""),
+        auth_token=os.getenv("PLIVO_AUTH_TOKEN", ""),
+    )
 
+    # Create transport with VAD
+    transport = FastAPIWebsocketTransport(
+        websocket=runner_args.websocket,
+        params=FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            add_wav_header=False,
+            vad_analyzer=SileroVADAnalyzer(
+                params=VADParams(
+                    stop_secs=0.2,
+                )
+            ),
+            serializer=serializer,
+        ),
+    )
 
+    handle_sigint = runner_args.handle_sigint
+
+    await run_bot(transport, handle_sigint)
